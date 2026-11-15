@@ -19,10 +19,6 @@
 const uint8_t CMD_REST_DETECTED = 0x01;
 const uint8_t CMD_CANCEL = 0x02; 
 
-BLEService sensorService(UUID_SERVICE);
-BLECharacteristic imuCharacteristic(UUID_IMU, BLENotify, sizeof(ImuPacket), true);
-BLECharacteristic commandCharacteristic(UUID_COMMAND, BLEWrite | BLEWriteWithoutResponse, 4);
-
 // OLED Constants
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -36,10 +32,18 @@ const uint32_t HR_STALE_MS = 3000;
 const uint8_t BPM_MIN = 30;
 const uint8_t BPM_MAX = 220;
 
+const uint16_t PPG_RATE_HZ = 100;
+const uint32_t PPG_POLL_MS = 40;
+const uint32_t FINGER_IR_MIN = 50000;
+const uint8_t PPG_REG_FIFO_DATA = 0x07; 
+const uint8_t PPG_BYTES_PER_SAMPLE = 6;
+const uint8_t PPG_SAMPLES_PER_READ = 10; 
+
 // IMU Constants 
 const uint16_t IMU_RATE_HZ = 50;
 const uint32_t IMU_PERIOD_US = 1000000UL / IMU_RATE_HZ;
 const uint8_t IMU_BATCH_SIZE = 10;
+
 
 // IMU Packet to send to laptop
 struct __attribute__((packed)) ImuPacket
@@ -58,11 +62,45 @@ uint32_t imu_last_us = 0;
 MAX30105 particleSensor;
 Adafruit_SSD1306 oledDisplay(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1, 400000UL, 400000UL);
 
+// Bluetooth Service Declaration
+BLEService sensorService(UUID_SERVICE);
+BLECharacteristic imuCharacteristic(UUID_IMU, BLENotify, sizeof(ImuPacket), true);
+BLECharacteristic commandCharacteristic(UUID_COMMAND, BLEWrite | BLEWriteWithoutResponse, 4);
+
 // Heart-Rate Averaging Values 
 uint8_t hr_values[HR_AVG_SIZE];
 uint8_t hr_index = 0;
 uint8_t hr_count = 0; 
 uint32_t last_reading_ms = 0;
+uint32_t ppg_sample_index = 0;
+uint32_t ppg_last_beat_index = 0;
+bool ppg_have_last_beat = false;
+bool hr_contact = false;
+
+/// @brief Recovery states for recovery state machine
+enum RecoveryState : uint8_t
+{
+    RECOVERY_IDLE,
+    RECOVERY_MEASURING,
+    RECOVERY_DONE,
+    RECOVERY_INVALID
+};
+
+const uint32_t RECOVERY_WINDOW_MS = 60000;
+const uint8_t HR_HISTORY_S = 15;
+
+RecoveryState recovery_state = RECOVERY_IDLE;
+uint8_t recovery_hr_start = 0;
+uint8_t recovery_hr_end = 0;
+uint32_t recovery_start_ms = 0; 
+
+uint8_t hr_history[HR_HISTORY_S] = {0};
+uint8_t hr_history_index = 0;
+uint32_t hr_history_last_ms = 0;
+
+bool ble_imu_subscribed();
+void recovery_start(uint8_t lookback_s);
+void recovery_cancel();
 
 /// @brief Add heart-rate reading to the circular buffer.
 /// @param bpm Heart-rate in beats per minute.
@@ -100,30 +138,65 @@ uint8_t hr_get_average()
     return (sum + hr_count / 2) / hr_count; 
 }
 
-/// @brief Display heart rate on OLED.
-/// @param bpm Heart rate in beats per minute.
-void display_heart_rate(uint8_t bpm)
+void hr_process_ir_sample(uint32_t ir)
 {
-    oledDisplay.clearDisplay();
-    oledDisplay.setTextColor(SSD1306_WHITE);
-    
-    oledDisplay.setTextSize(1);
-    oledDisplay.setCursor(0, 0);
-    oledDisplay.print("Heart rate");
+    ppg_sample_index++;
 
-    oledDisplay.setTextSize(3);
-    oledDisplay.setCursor(0, 20);
-    if (bpm) oledDisplay.print(bpm);
-    else oledDisplay.print("--");
+    if (ir < FINGER_IR_MIN)
+    {
+        if (hr_contact)
+        {
+            hr_reset();
+            ppg_have_last_beat = false;
+        }
+        hr_contact = false;
+        return;
+    }
+    hr_contact = true;
 
-    oledDisplay.setTextSize(1);
-    oledDisplay.setCursor(70, 34);
-    oledDisplay.print("BPM");
+    if (!checkForBeat((int32_t)ir)) return;
 
-    oledDisplay.display();
+    if (ppg_have_last_beat)
+    {
+        uint32_t dt = ppg_sample_index - ppg_last_beat_index;
+        hr_add_reading((60UL * PPG_RATE_HZ) / dt);
+    }
+    ppg_last_beat_index = ppg_sample_index;
+    ppg_have_last_beat = true;
+}
 
-    Serial.print("Display BPM: ");
-    Serial.println(bpm);
+uint32_t ppg_read18()
+{
+    uint32_t v = (uint32_t)Wire.read() << 16;
+    v |= (uint32_t)Wire.read() << 8; 
+    v |= (uint32_t)Wire.read();
+
+    return v & 0x3FFFF;
+}
+
+/// @brief Read all new samples from the MAX30102 FIFO.
+/// SparkFun's check() only buffers 4 samples, so we read the register directly.
+void hr_drain_fifo()
+{
+    int n = (int)particleSensor.getWritePointer() - (int)particleSensor.getReadPointer();
+    if (n < 0) n += 32;
+
+    while (n > 0)
+    {
+        uint8_t chunk = n > PPG_SAMPLES_PER_READ ? PPG_SAMPLES_PER_READ : (uint8_t)n;
+
+        Wire.beginTransmission(MAX30105_ADDRESS);
+        Wire.write(PPG_REG_FIFO_DATA);
+        Wire.endTransmission();
+        Wire.requestFrom((uint8_t)MAX30105_ADDRESS, (uint8_t)(chunk * PPG_BYTES_PER_SAMPLE));
+
+        for (uint8_t i = 0; i < chunk; i++)
+        {
+            (void)ppg_read18();                 // red, unused
+            hr_process_ir_sample(ppg_read18()); // IR
+        }
+        n -= chunk;
+    }
 }
 
 /// @brief Send IMU packet over bluetooth to connected device.
@@ -185,26 +258,6 @@ void on_command_written(BLEDevice central, BLECharacteristic characteristic)
     }
 }
 
-enum RecoveryState : uint8_t
-{
-    RECOVERY_IDLE,
-    RECOVERY_MEASURING,
-    RECOVERY_DONE,
-    RECOVERY_INVALID
-};
-
-const uint32_t RECOVERY_WINDOW_MS = 60000;
-const uint8_t HR_HISTORY_S = 15;
-
-RecoveryState recovery_state = RECOVERY_IDLE;
-uint8_t recovery_hr_start = 0;
-uint8_t recovery_hr_end = 0;
-uint32_t recovery_start_ms = 0; 
-
-uint8_t hr_history[HR_HISTORY_S] = {0};
-uint8_t hr_history_index = 0;
-uint32_t hr_history_last_ms = 0;
-
 uint8_t hr_peak_recent(uint8_t lookback_s)
 {
     uint8_t peak = hr_get_average();
@@ -215,6 +268,8 @@ uint8_t hr_peak_recent(uint8_t lookback_s)
         uint8_t v = hr_history[(hr_history_index + HR_HISTORY_S - i) % HR_HISTORY_S];
         if (v > peak) peak = v;
     }
+
+    return peak;
 }
 
 int16_t recovery_get_hrr()
@@ -234,7 +289,6 @@ uint8_t recovery_seconds_left()
 // Recovery "interrupt" functions
 void recovery_start(uint8_t lookback_s)
 {
-    (void)lookback_s;
     if (recovery_state == RECOVERY_MEASURING)
     {
         Serial.println("Recovery already running - ignoring");
@@ -265,6 +319,79 @@ void recovery_cancel()
     Serial.println("Recovery cancelled");
 }
 
+/// @brief Draw recovery status on the bottom two lines.
+void display_recovery_status()
+{
+    oledDisplay.setTextSize(1);
+    oledDisplay.setCursor(0, 46);
+
+    switch (recovery_state)
+    {
+        case RECOVERY_IDLE:
+            oledDisplay.print("Recovery: waiting");
+            break;
+
+        case RECOVERY_MEASURING:
+            oledDisplay.print("Recovering... ");
+            oledDisplay.print(recovery_seconds_left());
+            oledDisplay.print("s");
+            oledDisplay.setCursor(0, 56);
+            oledDisplay.print("Start: ");
+            oledDisplay.print(recovery_hr_start);
+            oledDisplay.print(" BPM");
+            break;
+
+        case RECOVERY_DONE:
+            oledDisplay.print("HRR: ");
+            oledDisplay.print(recovery_get_hrr());
+            oledDisplay.print(" BPM");
+            oledDisplay.setCursor(0, 56);
+            oledDisplay.print(recovery_hr_start);
+            oledDisplay.print(" -> ");
+            oledDisplay.print(recovery_hr_end);
+            break;
+
+        case RECOVERY_INVALID:
+            oledDisplay.print("Recovery: no HR");
+            oledDisplay.setCursor(0, 56);
+            oledDisplay.print("Check sensor contact");
+            break;
+    }
+}
+
+/// @brief Display heart rate on OLED.
+/// @param bpm Heart rate in beats per minute.
+void display_heart_rate(uint8_t bpm)
+{
+    oledDisplay.clearDisplay();
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    
+    oledDisplay.setTextSize(1);
+    oledDisplay.setCursor(0, 0);
+    oledDisplay.print("Heart rate");
+
+    if (!hr_contact)
+    {
+        oledDisplay.setCursor(70, 0);
+        oledDisplay.print("no contact");
+    }
+
+    oledDisplay.setTextSize(3);
+    oledDisplay.setCursor(0, 14);
+    if (bpm) oledDisplay.print(bpm);
+    else oledDisplay.print("--");
+
+    oledDisplay.setTextSize(1);
+    oledDisplay.setCursor(70, 28);
+    oledDisplay.print("BPM");
+
+    display_recovery_status();
+    oledDisplay.display();
+
+    Serial.print("Display BPM: ");
+    Serial.println(bpm);
+}
+
 /// @brief Update readings from MAX30102 sensor.
 void hr_update()
 {
@@ -280,20 +407,32 @@ void hr_update()
         next_beat_ms = now + 60000UL / bpm;
     }
 
+    hr_contact = true;
+
 #else 
-    // TODO: Incorporate MAX30102
+    static uint32_t last_poll_ms = 0;
+    uint32_t now = millis();
+    if (now - last_poll_ms < PPG_POLL_MS) return;
+    last_poll_ms = now;
+
+    hr_drain_fifo();
 
 #endif
 }
 
 /// @brief Update OLED display.
 void display_update()
-{
+{   
+    static RecoveryState last_state = RECOVERY_IDLE;
+
     static uint32_t last_draw_ms = 0;
     uint32_t now = millis();
 
-    if (now - last_draw_ms < DISPLAY_PERIOD_MS) return;
+    bool state_changed = (recovery_state != last_state);
+    if (!state_changed && now - last_draw_ms < DISPLAY_PERIOD_MS) return;
+
     last_draw_ms = now;
+    last_state = recovery_state;
 
     display_heart_rate(hr_get_average());
 }
@@ -314,10 +453,10 @@ void imu_update()
 
     imu_packet.samples[imu_sample_count][0] = (int16_t)(ax * 1000.0f);
     imu_packet.samples[imu_sample_count][1] = (int16_t)(ay * 1000.0f);
-    imu_packet.samples[imu_sample_count][2] = (int16_t)(ax * 1000.0f);
-    imu_packet.samples[imu_sample_count][3] = (int16_t)(ax * 10.0f);
-    imu_packet.samples[imu_sample_count][4] = (int16_t)(ax * 10.0f);
-    imu_packet.samples[imu_sample_count][5] = (int16_t)(ax * 10.0f);
+    imu_packet.samples[imu_sample_count][2] = (int16_t)(az * 1000.0f);
+    imu_packet.samples[imu_sample_count][3] = (int16_t)(gx * 10.0f);
+    imu_packet.samples[imu_sample_count][4] = (int16_t)(gy * 10.0f);
+    imu_packet.samples[imu_sample_count][5] = (int16_t)(gz * 10.0f);
 
     if (++imu_sample_count == IMU_BATCH_SIZE)
     {
@@ -363,7 +502,8 @@ void initialize_serial_monitor(int baud_rate)
 {
     Serial.begin(baud_rate);
     Serial.println("Initializing Serial Monitor...");
-    while (!Serial) { delay(10); }
+    uint32_t start = millis();
+    while (!Serial && millis() - start < 2000) { delay(10); }
     Serial.println("Initialized Serial Monitor...");
 }
 
@@ -393,6 +533,7 @@ bool initialize_hr()
 
     particleSensor.setup(0x1F, 4, 2);
     particleSensor.setPulseAmplitudeRed(0x0A); // Red LED on Low Power
+    particleSensor.clearFIFO();
 
     Serial.println("MAX30102 Sensor Initialized!");
     return true;
@@ -445,6 +586,10 @@ void setup()
     if (!initialize_hr()) while (true) {};
     if (!initialize_oled_display()) while (true) {};
     if (!initialize_ble()) while (true) {};
+
+    Wire.setClock(400000);
+    imu_last_us = micros();
+    hr_history_last_ms = millis();
 }
 
 void loop() {
