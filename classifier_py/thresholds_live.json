@@ -1,0 +1,18 @@
+{
+  "T_WALK": 0.1163,
+  "T_RUN": 0.2524,
+  "windows": {
+    "still": {
+      "public": 5449,
+      "own": 57
+    },
+    "walking": {
+      "public": 2313,
+      "own": 57
+    },
+    "running": {
+      "public": 925,
+      "own": 57
+    }
+  }
+}
