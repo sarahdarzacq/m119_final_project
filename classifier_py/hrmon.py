@@ -2,14 +2,13 @@
 The board (HRMon sketch) sends 10 IMU samples per packet at 50 Hz
 
 Commands
-  train <still|walking|running> <seconds> : to record user-labeled data, and refit
-  undo : remove the last recording and refit
-  refit : recompute thresholds from all data now
-  status : show thresholds and recordings
-  quit
-  python live.py --refit     recompute thresholds without connecting to the board
+    train <still|walking|running> <seconds> : record and add labeled training data
+    undo : remove the last recording and reload the dataset
+    why : explain the latest classification
+    status : show classifier and dataset information
+    quit
 """
-import sys, os, glob, json, struct, time, asyncio, threading
+import sys, os, glob, struct, time, asyncio, threading
 from collections import deque
 import numpy as np
 
@@ -32,66 +31,112 @@ RECOVERY_S = 60 # the board's recovery window; an abort after this would erase i
 TRIGGER_FROM = {"walking", "running"} # use {"running"} to trigger after running only
 STOP_LAG_S = SETTLE_S + 2 # estimated seconds between the actual stop and the confirmation (7-8 s in tests)
 ORDER = ["still", "walking", "running"]
-BASE = os.path.dirname(os.path.abspath(__file__))
-DATASET = os.path.join(BASE, "dataset_live") # user data
-PUBLIC_DIR = os.path.join(BASE, "dataset_public") # public data
-THRESH_FILE = os.path.join(BASE, "thresholds_live.json")
-OWN_SHARE = 0.5 # share of a class's weight given to your own windows once they exist
-DEFAULT_THRESH = (0.104, 0.220) # starting point (from the test recordings); replaced by 'train'
 
+K = 15 # neighbor threshold
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE, "dataset")
+OWN_PREFIX = "own_"
+OWN_SHARE = 0.5 # share of a class's weight given to your own windows once they exist
 
 def mad(w):
     return float(np.abs(w - w.mean()).mean())
 
-def mad_windows(x):
+def window_features(w):
+    w = np.asarray(w, dtype=float)
+    w = w - w.mean()
+    n = len(w)
+    p = np.abs(np.fft.rfft(w * np.hanning(n+1)[:-1])) ** 2
+    f = np.fft.rfftfreq(n, 1 / FS)
+    m = (f > 0.5) & (f < 4)
+    return np.array([np.abs(w).mean(), w.std(), np.ptp(w), 
+                     f[m][p[m].argmax()], p[m].max() / (p[m].sum() + 1e-12)])
+
+def feature_windows(x):
     win, step = FS * WIN_S, FS * STEP_S
-    return np.array([mad(x[i:i + win]) for i in range(0, len(x) - win + 1, step)])
+    rows = [window_features(x[i:i + win]) for i in range(0, len(x) - win + 1, step)]
+    return np.array(rows) if rows else np.empty((0, 5))
 
-def best_cut(lo, wlo, hi, whi):
-    """Cutoff between a lower and a higher class, minimizing the average per-class
-    weighted error (weights sum to 1 within each class). Ties resolve to the middle
-    of the best range, which is the centre of the gap when the classes don't overlap."""
-    olo, ohi = np.argsort(lo), np.argsort(hi)
-    lo_s, hi_s = lo[olo], hi[ohi]
-    clo = np.concatenate([[0.0], np.cumsum(wlo[olo] / wlo.sum())])
-    chi = np.concatenate([[0.0], np.cumsum(whi[ohi] / whi.sum())])
-    vals = np.unique(np.concatenate([lo, hi]))
-    cands = (vals[:-1] + vals[1:]) / 2
-    err = ((1 - clo[np.searchsorted(lo_s, cands, side="left")]) # lower class at/above the cut
-           + chi[np.searchsorted(hi_s, cands, side="left")]) / 2 # higher class below the cut
-    best = cands[err <= err.min() + 1e-12]
-    return float((best[0] + best[-1]) / 2), float(err.min())
+def is_own(path):
+    return os.path.basename(path).startswith(OWN_PREFIX)
 
+def dataset_files(label, own=None):
+    return [f for f in sorted(glob.glob(os.path.join(DATA_DIR, label, "*.csv"))) if own is None or is_own(f) == own]
 
-def class_windows(folder, label):
-    arrs = []
-    for f in sorted(glob.glob(os.path.join(folder, label, "*.csv"))):
-        w = mad_windows(np.loadtxt(f, delimiter=",", skiprows=1, ndmin=1))
-        if len(w):
-            arrs.append(w)
-    return np.concatenate(arrs) if arrs else np.array([])
+class KnnStore:
+    def __init__(self):
+        self.X = np.empty((0, 5))
+        self.yi = np.empty(0, int)
+        self.own = np.empty(0, bool)
+        self._prepare()
 
+    def load(self):
+        Xs, ys, owns = [], [] ,[]
+        for ci, c in enumerate(ORDER):
+            for f in dataset_files(c):
+                F = feature_windows(np.loadtxt(f, delimiter=",", skiprows=1, ndmin=1))
+                if len(F):
+                    Xs.append(F)
+                    ys.append(np.full(len(F), ci))
+                    owns.append(np.full(len(F), is_own(f)))
+        self.X = np.vstack(Xs) if Xs else np.empty((0,5))
+        self.yi = np.concatenate(ys) if ys else np.empty(0, int)
+        self.own = np.concatenate(owns) if owns else np.empty(0, bool)
+        self._prepare()
 
-def blend(pub, own):
-    """Windows and weights for one class. Without own data, public windows count fully;
-    with it, your windows carry OWN_SHARE of the total weight."""
-    share = 0.0 if len(own) == 0 else (1.0 if len(pub) == 0 else OWN_SHARE)
-    x = np.concatenate([pub, own])
-    w = np.concatenate([np.full(len(pub), (1 - share) / max(len(pub), 1)),
-                        np.full(len(own), share / max(len(own), 1))])
-    return x, w
+    def add(self, F, label, own):
+        if len(F) == 0: return 0
+        self.X = np.vstack([self.X, F])
+        self.yi = np.concatenate([self.yi, np.full(len(F), ORDER.index(label))])
+        self.own = np.concatenate([self.own, np.full(len(F), own)])
+        self._prepare()
+        return len(F)
 
+    def _prepare(self):
+        if len(self.X) == 0:
+            self.mu, self.sd, self.Z, self.w = np.zeros(5), np.ones(5), np.empty((0, 5)), np.empty(0)
+            return
+        self.mu, self.sd = self.X.mean(0), self.X.std(0) + 1e-9
+        self.Z = (self.X - self.mu) / self.sd
+        self.w = np.zeros(len(self.yi))
+        for ci in range(len(ORDER)):
+            m = self.yi == ci
+            mo, mp = m & self.own, m & ~self.own
+            share = 0.0 if not mo.any() else (1.0 if not mp.any() else OWN_SHARE)
+            self.w[mp] = (1 - share) / max(mp.sum(), 1)
+            self.w[mo] = share / max(mo.sum(), 1)
+
+    def ready(self): return all((self.yi == i).any() for i in range(len(ORDER)))
+
+    def summary(self):
+        return ", ".join(f"{c} {int(((self.yi == i) & ~self.own).sum())}+{int(((self.yi == i) & self.own).sum())}"
+                         for i, c in enumerate(ORDER)) + " windows (public+own)"
+
+    def classify(self, F):
+        d = np.linalg.norm(self.Z - (F - self.mu) / self.sd, axis=1)
+        idx = np.argpartition(d, K)[:K] if len(d) > K else np.arange(len(d))
+        votes = np.zeros(len(ORDER))
+        np.add.at(votes, self.yi[idx], self.w[idx] / (d[idx] + 1e-6))
+        k = int(votes.argmax())
+        conf = float(votes[k] / votes.sum())
+        return ORDER[k], conf, {"features": F, "conf": conf, "nearest": float(d.min()),
+                                "neighbors": np.bincount(self.yi[idx], minlength=len(ORDER)),
+                                "n_own": int(self.own[idx].sum())}
 
 class Processor:
     def __init__(self):
-        self.t_walk, self.t_run = self._load_thresholds()
         self.buf = deque(maxlen=FS * WIN_S)
-        self.n = 0                       # samples received
+        self.n = 0 # samples received
         self.reset_state()
         self.rec = None
         self.last_file = None
-        if not os.path.exists(THRESH_FILE) and glob.glob(os.path.join(PUBLIC_DIR, "*", "*.csv")):
-            print(self.refit())
+        self.last_info = None
+        self.store = KnnStore()
+        self.store.load()
+        if not self.store.ready():
+            raise RuntimeError(
+                "kNN requires training data for still, walking, and running."
+            )
 
     def reset_state(self):
         self.state = None # confirmed activity
@@ -100,15 +145,8 @@ class Processor:
         self.active_secs = 0
         self.rest_t = None
 
-    @staticmethod
-    def _load_thresholds():
-        if os.path.exists(THRESH_FILE):
-            d = json.load(open(THRESH_FILE))
-            return d["T_WALK"], d["T_RUN"]
-        return DEFAULT_THRESH
-
-    def classify(self, m):
-        return "still" if m < self.t_walk else ("walking" if m < self.t_run else "running")
+    def _decide(self, F):
+        return self.store.classify(F)
 
     # streaming 
     def feed(self, samples):
@@ -126,11 +164,12 @@ class Processor:
         if self.rec is not None:
             return []
         events = []
-        m = mad(np.fromiter(self.buf, float))
-        raw = self.classify(m)
+        F = window_features(np.asarray(self.buf, dtype=float))
+        raw, conf, info = self._decide(F)
+        self.last_info = info
         self.streak = self.streak + 1 if raw == self.raw_prev else 1
         self.raw_prev = raw
-        events.append(("TICK", m, raw))
+        events.append(("TICK", float(F[0]), raw, conf))
 
         if self.state is None: # first window: adopt it, no events
             self.state = raw
@@ -178,52 +217,56 @@ class Processor:
             events.append(("INFO", self._finish(r)))
 
     def _finish(self, r):
-        folder = os.path.join(DATASET, r["label"])
+        folder = os.path.join(DATA_DIR, r["label"])
         os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, f"{r['label']}_{len(glob.glob(folder + '/*.csv')):03d}.csv")
+        n = 0
+        while os.path.exists(os.path.join(folder, f"{OWN_PREFIX}{r['label']}_{n:03d}.csv")):
+            n += 1
+        path = os.path.join(folder, f"{OWN_PREFIX}{r['label']}_{n:03d}.csv")
         x = np.array(r["data"])
         np.savetxt(path, x, delimiter=",", header="mag_g", comments="", fmt="%.4f")
         self.last_file = path
-        w = mad_windows(x)
-        agree = float(np.mean([self.classify(m) == r["label"] for m in w])) if len(w) else 0.0
-        msg = [f"saved {path} ({len(x)} samples)"]
-        if agree < 0.7:
-            msg.append(f"WARNING: only {agree:.0%} of this recording looks like '{r['label']}' "
-                       "under the current thresholds. Mislabeled? Type 'undo' to remove it.")
-        msg.append(self.refit())
+        F = feature_windows(x)
+        msg = [f"saved {path} ({len(x)} samples, {len(F)} windows)"]
+        if len(F):
+            # judged BEFORE adding, otherwise the new windows would vote for themselves
+            agree = float(np.mean([self._decide(f)[0] == r["label"] for f in F]))
+            if agree < 0.7:
+                msg.append(f"NOTE: only {agree:.0%} of this recording looks like '{r['label']}' to the "
+                           f"current knn classifier. That is expected if your motion differs from the "
+                           "dataset (it adapts now); if you picked the wrong label, type 'undo'.")
+        self.store.add(F, r["label"], own=True)
+        msg.append(f"added to the dataset: {self.store.summary()}")
         return "\n".join(msg)
-
-    def refit(self):
-        data, counts = {}, {}
-        for c in ORDER:
-            pub, own = class_windows(PUBLIC_DIR, c), class_windows(DATASET, c)
-            counts[c] = (len(pub), len(own))
-            data[c] = blend(pub, own) if len(pub) + len(own) else None
-        missing = [c for c in ORDER if data[c] is None]
-        if missing:
-            return (f"thresholds unchanged (no data yet for: {', '.join(missing)}; "
-                    f"run import_pamap2.py or record with 'train')")
-        self.t_walk, _ = best_cut(*data["still"], *data["walking"])
-        self.t_run, _ = best_cut(*data["walking"], *data["running"])
-        json.dump({"T_WALK": round(self.t_walk, 4), "T_RUN": round(self.t_run, 4),
-                   "windows": {c: {"public": counts[c][0], "own": counts[c][1]} for c in ORDER}},
-                  open(THRESH_FILE, "w"), indent=2)
-        return (f"thresholds updated: T_WALK={self.t_walk:.3f}  T_RUN={self.t_run:.3f}  "
-                f"(public/own windows: {', '.join(f'{c} {counts[c][0]}/{counts[c][1]}' for c in ORDER)})")
-
+    
     def undo(self):
-        if not self.last_file or not os.path.exists(self.last_file):
-            return "nothing to undo"
+        if not self.last_file or not os.path.exists(self.last_file): return "nothing to undo"
+
         os.remove(self.last_file)
-        gone, self.last_file = self.last_file, None
-        return f"removed {gone}\n" + self.refit()
+        gone = self.last_file
+        self.last_file = None
 
+        self.store.load()
+        return f"removed {gone}\n{self.store.summary()}"
+    
     def status(self):
-        own = {c: len(glob.glob(os.path.join(DATASET, c, "*.csv"))) for c in ORDER}
-        pub = {c: len(glob.glob(os.path.join(PUBLIC_DIR, c, "*.csv"))) for c in ORDER}
-        return (f"T_WALK={self.t_walk:.3f}  T_RUN={self.t_run:.3f}  "
-                f"own recordings: {own}  public recordings: {pub}  confirmed state: {self.state}")
-
+        return (
+            f"classifier=kNN  "
+            f"dataset: {self.store.summary()}  "
+            f"confirmed state: {self.state}"
+        )
+    
+    def why(self):
+        i = self.last_info
+        if not i:
+            return "nothing classified yet (the first window needs 4 s of data)"
+        F = i["features"]
+        head = (f"features: mad={F[0]:.3f} g, spread={F[1]:.3f}, range={F[2]:.2f}, "
+                f"cadence={F[3]:.2f} Hz, peak share={F[4]:.2f}")
+        votes = ", ".join(f"{n} {c}" for c, n in zip(ORDER, i["neighbors"]) if n)
+        return (head + f"\n{K} nearest stored windows: {votes} ({i['n_own']} from your recordings); "
+                       f"nearest distance {i['nearest']:.2f} (large = unlike anything stored)"
+                       f"\nvote -> {self.raw_prev} (confidence {i['conf']:.0%}); confirmed state: {self.state}")
 
 #  Bluetooth 
 def parse_packet(data):
@@ -234,11 +277,9 @@ def parse_packet(data):
     # gyro (s[:, 3:] / 10.0, deg/s) is in the packet but not used yet
     return seq, np.linalg.norm(acc, axis=1).tolist()
 
-
 def console(loop, q):
     for line in sys.stdin:
         loop.call_soon_threadsafe(q.put_nowait, line.strip())
-
 
 def handle_cmd(proc, line):
     p = line.split()
@@ -248,16 +289,16 @@ def handle_cmd(proc, line):
         print(proc.start_recording(p[1], int(p[2])))
     elif p[0] == "undo":
         print(proc.undo())
-    elif p[0] == "refit":
-        print(proc.refit())
+    elif p[0] == "why":
+        print(proc.why())
     elif p[0] == "status":
         print(proc.status())
     elif p[0] == "quit":
         return True
     else:
-        print("commands: train <still|walking|running> <seconds >= 8>, undo, refit, status, quit")
+        print("commands: train <still|walking|running> <seconds >= 8>, undo, why, "
+              "status, quit")
     return False
-
 
 async def run_ble(proc):
     from bleak import BleakScanner, BleakClient # imported here so Processor can be tested without bleak
@@ -281,7 +322,7 @@ async def run_ble(proc):
         seq, vals = parse_packet(data)
         if link["seq"] is not None:
             gap = (seq - link["seq"] - 1) % 65536
-            if 0 < gap < 500:                        # keep timing aligned across lost packets
+            if 0 < gap < 500: # keep timing aligned across lost packets
                 link["drops"] += gap
                 vals = [link["val"]] * (SAMPLES_PER_PACKET * gap) + vals
         link["seq"], link["val"] = seq, vals[-1]
@@ -290,8 +331,9 @@ async def run_ble(proc):
 
     async with BleakClient(dev) as client:
         await client.start_notify(DATA_UUID, on_data)
-        print("Connected. Type: train <still|walking|running> <seconds>, undo, refit, status, quit")
-        print(f"Using T_WALK={proc.t_walk:.3f}, T_RUN={proc.t_run:.3f}")
+        print("Connected. Type: train <still|walking|running> <seconds>, undo, why, "
+              "status, quit")
+        print(proc.status())
         threading.Thread(target=console, args=(loop, cmd_q), daemon=True).start()
 
         while client.is_connected:
@@ -304,7 +346,8 @@ async def run_ble(proc):
                 continue
             kind = ev[0]
             if kind == "TICK":
-                print(f"{time.strftime('%H:%M:%S')}  mad={ev[1]:.3f}  {ev[2]:8s} "
+                conf = f"  conf={ev[3]:.0%}" if ev[3] is not None else ""
+                print(f"{time.strftime('%H:%M:%S')}  mad={ev[1]:.3f}  {ev[2]:8s}{conf}  "
                       f"confirmed={proc.state}  drops={link['drops']}")
             elif kind == "STATE":
                 print(f"*** state change: {ev[1]} -> {ev[2]}")
@@ -318,9 +361,8 @@ async def run_ble(proc):
                 print(ev[1])
         print("Disconnected.")
 
-
 if __name__ == "__main__":
-    if "--refit" in sys.argv:
-        print(Processor().refit())
-    else:
+    try:
         asyncio.run(run_ble(Processor()))
+    except KeyboardInterrupt:
+        print("\nProgram stopped by user.")
